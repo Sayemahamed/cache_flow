@@ -51,6 +51,7 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
+from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 from dataclasses import dataclass, field
 import math
@@ -73,43 +74,68 @@ print(f"Expert Capacity: {EXPERT_CAPACITY} (Simulated Constraint)")
 # %% [markdown]
 # Start of Qwen2MoE Raw Implementation
 
-@dataclass
-class Qwen2MoeConfig:
-    vocab_size: int = 151936
-    hidden_size: int = 2048
-    intermediate_size: int = 5632
-    num_hidden_layers: int = 24
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 16
-    hidden_act: str = "silu"
-    max_position_embeddings: int = 32768
-    initializer_range: float = 0.02
-    rms_norm_eps: float = 1e-6
-    use_cache: bool = True
-    rope_theta: float = 10000.0
-    attention_dropout: float = 0.0
-    num_experts_per_tok: int = 2
-    num_experts: int = 60
-    moe_intermediate_size: int = 1408
-    shared_expert_intermediate_size: int = 5632
-    sliding_window: int = 32768
-    max_window_layers: int = 28
-    decoder_sparse_step: int = 1
-    mlp_only_layers: list = field(default_factory=list)
-    rope_scaling: dict = None
-    _attn_implementation: str = "eager"
-    output_attentions: bool = False
-    output_router_logits: bool = False
-    output_hidden_states: bool = False
-    pad_token_id: int = 151643
-    qkv_bias: bool = True
-    norm_topk_prob: bool = False
-    
-    def to_dict(self):
-        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+class Qwen2MoeConfig(PretrainedConfig):
+    model_type = "qwen2_moe"
+    keys_to_ignore_at_inference = ["past_key_values"]
 
-    def get_text_config(self):
-        return self
+    def __init__(
+        self,
+        vocab_size=151936,
+        hidden_size=2048,
+        intermediate_size=5632,
+        num_hidden_layers=24,
+        num_attention_heads=16,
+        num_key_value_heads=16,
+        hidden_act="silu",
+        max_position_embeddings=32768,
+        initializer_range=0.02,
+        rms_norm_eps=1e-6,
+        use_cache=True,
+        rope_theta=10000.0,
+        attention_dropout=0.0,
+        num_experts_per_tok=2,
+        num_experts=60,
+        moe_intermediate_size=1408,
+        shared_expert_intermediate_size=5632,
+        sliding_window=32768,
+        max_window_layers=28,
+        decoder_sparse_step=1,
+        mlp_only_layers=None,
+        rope_scaling=None,
+        pad_token_id=151643,
+        qkv_bias=True,
+        norm_topk_prob=False,
+        **kwargs,
+    ):
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.use_cache = use_cache
+        self.rms_norm_eps = rms_norm_eps
+        self.rope_theta = rope_theta
+        self.attention_dropout = attention_dropout
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_experts = num_experts
+        self.moe_intermediate_size = moe_intermediate_size
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
+        self.sliding_window = sliding_window
+        self.max_window_layers = max_window_layers
+        self.decoder_sparse_step = decoder_sparse_step
+        self.mlp_only_layers = mlp_only_layers if mlp_only_layers is not None else []
+        self.num_key_value_heads = num_key_value_heads
+        self.hidden_act = hidden_act
+        self.rope_scaling = rope_scaling
+        self.qkv_bias = qkv_bias
+        self.norm_topk_prob = norm_topk_prob
+        self.initializer_range = initializer_range
+
+        super().__init__(
+            pad_token_id=pad_token_id,
+            **kwargs,
+        )
 
 def load_balancing_loss_func(gate_logits, num_experts=None, top_k=2, attention_mask=None):
     if gate_logits is None or not isinstance(gate_logits, tuple): return 0
@@ -357,8 +383,75 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
         return MoeModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=past_key_values, hidden_states=all_hidden_states, attentions=all_self_attns, router_logits=all_router_logits)
     
     def _update_causal_mask(self, attention_mask, input_tensor, cache_position, past_key_values, output_attentions):
-        if self.config._attn_implementation == "flash_attention_2" or self.config._attn_implementation == "sdpa": return attention_mask # Simple fallback
-        return AttentionMaskConverter(is_causal=True, sliding_window=self.config.sliding_window).to_4d(attention_mask, input_tensor.shape[-2], input_tensor.dtype, input_tensor.device) # Simplified
+        if self.config._attn_implementation == "flash_attention_2":
+            if attention_mask is not None and 0.0 in attention_mask: return attention_mask
+            return None
+            
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        using_static_cache = isinstance(past_key_values, StaticCache)
+
+        dtype = input_tensor.dtype
+        min_dtype = torch.finfo(dtype).min
+        sequence_length = input_tensor.shape[1]
+        if using_static_cache:
+            target_length = past_key_values.get_max_cache_shape()
+        else:
+            target_length = (
+                attention_mask.shape[-1]
+                if isinstance(attention_mask, torch.Tensor)
+                else past_seen_tokens + sequence_length + 1
+            )
+
+        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask,
+            sequence_length=sequence_length,
+            target_length=target_length,
+            dtype=dtype,
+            cache_position=cache_position,
+            batch_size=input_tensor.shape[0],
+            config=self.config,
+            past_key_values=past_key_values,
+        )
+        return causal_mask
+
+    @staticmethod
+    def _prepare_4d_causal_attention_mask_with_cache_position(
+        attention_mask: torch.Tensor,
+        sequence_length: int,
+        target_length: int,
+        dtype: torch.dtype,
+        cache_position: torch.Tensor,
+        batch_size: int,
+        config: Qwen2MoeConfig,
+        past_key_values: Cache,
+    ):
+        if attention_mask is not None and attention_mask.dim() == 4:
+            causal_mask = attention_mask
+        else:
+            min_dtype = torch.finfo(dtype).min
+            causal_mask = torch.full(
+                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
+            )
+            diagonal_attend_mask = torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
+            text_config = config.get_text_config()
+            if getattr(text_config, "use_sliding_window", True) and text_config.sliding_window is not None:
+                is_static_sliding_cache = isinstance(past_key_values, StaticCache) and all(past_key_values.is_sliding)
+                if not is_static_sliding_cache or sequence_length > target_length:
+                    sliding_attend_mask = torch.arange(target_length, device=cache_position.device) <= (
+                        cache_position.reshape(-1, 1) - text_config.sliding_window
+                    )
+                    diagonal_attend_mask.bitwise_or_(sliding_attend_mask)
+            causal_mask *= diagonal_attend_mask
+            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()
+                if attention_mask.shape[-1] > target_length:
+                    attention_mask = attention_mask[:, :target_length]
+                mask_length = attention_mask.shape[-1]
+                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(causal_mask.device)
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(padding_mask, min_dtype)
+        return causal_mask
         
 class Qwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
@@ -388,8 +481,8 @@ class Qwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
         if past_key_values is not None:
              if isinstance(past_key_values, Cache):
                  cache_length = past_key_values.get_seq_length()
-                 past_length = past_key_values.seen_tokens
-                 max_cache_length = past_key_values.get_max_length()
+                 past_length = past_key_values.get_seq_length()
+                 max_cache_length = past_key_values.get_max_length() if hasattr(past_key_values, "get_max_length") else None
              else:
                  past_length = past_key_values[0][0].shape[2]
                  max_cache_length = None
