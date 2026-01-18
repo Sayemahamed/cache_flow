@@ -28,7 +28,7 @@
 # **Installing Dependencies**
 
 # %%
-!pip install -q --upgrade torch transformers accelerate bitsandbytes scipy pandas matplotlib seaborn
+# !pip install -q --upgrade torch transformers accelerate bitsandbytes scipy pandas matplotlib seaborn
 
 # %% [markdown]
 # **Imports and Configurations**
@@ -44,8 +44,18 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import gc
 from copy import deepcopy
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
+from transformers import AutoTokenizer, BitsAndBytesConfig, AutoConfig
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.generation import GenerationMixin
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import logging
+from dataclasses import dataclass, field
+import math
+
+logger = logging.get_logger(__name__)
 
 # Visualization Style
 plt.style.use('seaborn-v0_8-paper')
@@ -61,6 +71,343 @@ print(f"Model: {MODEL_ID}")
 print(f"Expert Capacity: {EXPERT_CAPACITY} (Simulated Constraint)")
 
 # %% [markdown]
+# Start of Qwen2MoE Raw Implementation
+
+@dataclass
+class Qwen2MoeConfig:
+    vocab_size: int = 151936
+    hidden_size: int = 2048
+    intermediate_size: int = 5632
+    num_hidden_layers: int = 24
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 16
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 32768
+    initializer_range: float = 0.02
+    rms_norm_eps: float = 1e-6
+    use_cache: bool = True
+    rope_theta: float = 10000.0
+    attention_dropout: float = 0.0
+    num_experts_per_tok: int = 2
+    num_experts: int = 60
+    moe_intermediate_size: int = 1408
+    shared_expert_intermediate_size: int = 5632
+    sliding_window: int = 32768
+    max_window_layers: int = 28
+    decoder_sparse_step: int = 1
+    mlp_only_layers: list = field(default_factory=list)
+    rope_scaling: dict = None
+    _attn_implementation: str = "eager"
+    output_attentions: bool = False
+    output_router_logits: bool = False
+    output_hidden_states: bool = False
+    pad_token_id: int = 151643
+    qkv_bias: bool = True
+    norm_topk_prob: bool = False
+    
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+    def get_text_config(self):
+        return self
+
+def load_balancing_loss_func(gate_logits, num_experts=None, top_k=2, attention_mask=None):
+    if gate_logits is None or not isinstance(gate_logits, tuple): return 0
+    compute_device = gate_logits[0].device
+    concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+    if attention_mask is None:
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+        expert_attention_mask = (attention_mask[None, :, :, None, None].expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts)).reshape(-1, top_k, num_experts).to(compute_device))
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(expert_attention_mask, dim=0)
+        router_per_expert_attention_mask = (attention_mask[None, :, :, None].expand((num_hidden_layers, batch_size, sequence_length, routing_weights.shape[1])).reshape(-1, routing_weights.shape[1]).to(compute_device))
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(router_per_expert_attention_mask, dim=0)
+    device_index = routing_weights.device.index if routing_weights.device.index is not None else 0
+    rank = routing_weights.shape[1] * int(device_index)
+    overall_loss = torch.sum(tokens_per_expert[:, rank : rank + routing_weights.shape[1]] * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts
+
+class Qwen2MoeRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+class Qwen2MoeRotaryEmbedding(nn.Module):
+    def __init__(self, config, device=None):
+        super().__init__()
+        self.rope_theta = config.rope_theta
+        self.max_position_embeddings = config.max_position_embeddings
+        self.dim = config.hidden_size // config.num_attention_heads
+        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.dim, 2, dtype=torch.float, device=device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.attention_scaling = 1.0
+    def forward(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+class Qwen2MoeMLP(nn.Module):
+    def __init__(self, config, intermediate_size=None):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1: return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+class Qwen2MoeAttention(nn.Module):
+    def __init__(self, config, layer_idx=None):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.attention_dropout = config.attention_dropout
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.rotary_emb = Qwen2MoeRotaryEmbedding(config=self.config)
+
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_values=None, output_attentions=False, use_cache=False, cache_position=None, position_embeddings=None):
+        bsz, q_len, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if past_key_values is not None:
+             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+QWEN2MOE_ATTENTION_CLASSES = {"eager": Qwen2MoeAttention, "flash_attention_2": Qwen2MoeAttention, "sdpa": Qwen2MoeAttention}
+
+class Qwen2MoeSparseMoeBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = nn.ModuleList([Qwen2MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)])
+        self.shared_expert = Qwen2MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
+        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+    def forward(self, hidden_states):
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        router_logits = self.gate(hidden_states)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob: routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+        final_hidden_states = torch.zeros((batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        shared_expert_output = self.shared_expert(hidden_states)
+        shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+        final_hidden_states = final_hidden_states + shared_expert_output
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
+
+class Qwen2MoeDecoderLayer(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = QWEN2MOE_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+        if (layer_idx not in config.mlp_only_layers) and (config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0):
+            self.mlp = Qwen2MoeSparseMoeBlock(config)
+        else:
+            self.mlp = Qwen2MoeMLP(config, intermediate_size=config.intermediate_size)
+        self.input_layernorm = Qwen2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_values=None, output_attentions=False, output_router_logits=False, use_cache=False, cache_position=None, position_embeddings=None, **kwargs):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, self_attn_weights = self.self_attn(hidden_states=hidden_states, attention_mask=attention_mask, position_ids=position_ids, past_key_values=past_key_values, output_attentions=output_attentions, use_cache=use_cache, cache_position=cache_position, position_embeddings=position_embeddings)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        router_logits = None
+        if isinstance(hidden_states, tuple): hidden_states, router_logits = hidden_states
+        hidden_states = residual + hidden_states
+        outputs = (hidden_states,)
+        if output_attentions: outputs += (self_attn_weights,)
+        if output_router_logits: outputs += (router_logits,)
+        return outputs
+
+class Qwen2MoePreTrainedModel(PreTrainedModel):
+    config_class = Qwen2MoeConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["Qwen2MoeDecoderLayer"]
+    _skip_keys_device_placement = "past_key_values"
+    _supports_flash_attn = False
+    _supports_sdpa = True
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None: module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None: module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, Qwen2MoeRMSNorm):
+            module.weight.data.fill_(1.0)
+
+class Qwen2MoeModel(Qwen2MoePreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList([Qwen2MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.norm = Qwen2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen2MoeRotaryEmbedding(config=config)
+        self.post_init()
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None, inputs_embeds=None, use_cache=None, output_attentions=None, output_hidden_states=None, output_router_logits=None, cache_position=None):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_router_logits = output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        if use_cache and past_key_values is None: past_key_values = DynamicCache(config=self.config)
+        if inputs_embeds is None: inputs_embeds = self.embed_tokens(input_ids)
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
+        if position_ids is None: position_ids = cache_position.unsqueeze(0)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        all_router_logits = () if output_router_logits else None
+        for decoder_layer in self.layers:
+            if output_hidden_states: all_hidden_states += (hidden_states,)
+            layer_outputs = decoder_layer(hidden_states, attention_mask=causal_mask, position_ids=position_ids, past_key_values=past_key_values, output_attentions=output_attentions, output_router_logits=output_router_logits, use_cache=use_cache, cache_position=cache_position, position_embeddings=position_embeddings)
+            hidden_states = layer_outputs[0]
+            if output_attentions: all_self_attns += (layer_outputs[1],)
+            if output_router_logits and layer_outputs[-1] is not None: all_router_logits += (layer_outputs[-1],)
+        hidden_states = self.norm(hidden_states)
+        if output_hidden_states: all_hidden_states += (hidden_states,)
+        return MoeModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=past_key_values, hidden_states=all_hidden_states, attentions=all_self_attns, router_logits=all_router_logits)
+    
+    def _update_causal_mask(self, attention_mask, input_tensor, cache_position, past_key_values, output_attentions):
+        if self.config._attn_implementation == "flash_attention_2" or self.config._attn_implementation == "sdpa": return attention_mask # Simple fallback
+        return AttentionMaskConverter(is_causal=True, sliding_window=self.config.sliding_window).to_4d(attention_mask, input_tensor.shape[-2], input_tensor.dtype, input_tensor.device) # Simplified
+        
+class Qwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
+    _tied_weights_keys = ["lm_head.weight"]
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = Qwen2MoeModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.router_aux_loss_coef = config.router_aux_loss_coef
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.post_init()
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None, inputs_embeds=None, labels=None, use_cache=None, output_attentions=None, output_hidden_states=None, output_router_logits=None, cache_position=None, **kwargs):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_router_logits = output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=use_cache, output_attentions=output_attentions, output_hidden_states=output_hidden_states, output_router_logits=output_router_logits, cache_position=cache_position)
+        hidden_states = outputs.last_hidden_state
+        logits = self.lm_head(hidden_states)
+        loss = None
+        aux_loss = None
+        if output_router_logits:
+             aux_loss = load_balancing_loss_func(outputs.router_logits, self.num_experts, self.num_experts_per_tok, attention_mask)
+        return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=outputs.past_key_values, hidden_states=outputs.hidden_states, attentions=outputs.attentions, router_logits=outputs.router_logits)
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, cache_position=None, **kwargs):
+        # Implementation required for GenerationMixin
+        if past_key_values is not None:
+             if isinstance(past_key_values, Cache):
+                 cache_length = past_key_values.get_seq_length()
+                 past_length = past_key_values.seen_tokens
+                 max_cache_length = past_key_values.get_max_length()
+             else:
+                 past_length = past_key_values[0][0].shape[2]
+                 max_cache_length = None
+             if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                 input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+             elif past_length < input_ids.shape[1]:
+                 input_ids = input_ids[:, past_length:]
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+             position_ids = attention_mask.long().cumsum(-1) - 1
+             position_ids.masked_fill_(attention_mask == 0, 1)
+             if past_key_values:
+                 position_ids = position_ids[:, -input_ids.shape[1] :]
+        if cache_position is None: cache_position = torch.arange(past_key_values.get_seq_length() if past_key_values is not None else 0, (past_key_values.get_seq_length() if past_key_values is not None else 0) + input_ids.shape[1], device=input_ids.device)
+        return {"input_ids": input_ids, "past_key_values": past_key_values, "use_cache": kwargs.get("use_cache"), "position_ids": position_ids, "attention_mask": attention_mask, "cache_position": cache_position}
+
+# End of Qwen2MoE Raw Implementation
+
 # **CacheFlow Expert Scheduler**
 
 # %%
@@ -206,7 +553,7 @@ if 'base_model' not in globals():
         bnb_4bit_quant_type="nf4",
     )
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    base_model = AutoModelForCausalLM.from_pretrained(
+    base_model = Qwen2MoeForCausalLM.from_pretrained(
         MODEL_ID,
         quantization_config=bnb_config,
         device_map="cuda:0",
