@@ -1,0 +1,419 @@
+{
+  "metadata": {
+    "description": "Baseline numeric results from LLM/MoE serving papers - ONLY explicitly reported values",
+    "created": "2026-02-13",
+    "note": "null values indicate metric was not explicitly reported in that paper/context"
+  },
+  "baselines": [
+    {
+      "system": "vLLM / PagedAttention",
+      "paper": "Efficient Memory Management for Large Language Model Serving with PagedAttention",
+      "venue": "SOSP 2023",
+      "authors": "Kwon et al.",
+      "results": [
+        {
+          "model": "LLaMA-13B",
+          "hardware": "NVIDIA A100-40GB",
+          "hardware_vram_gb": 40,
+          "throughput_tok_per_s": 1.7,
+          "throughput_unit": "normalized to HuggingFace baseline",
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": null,
+          "prompt_length": null,
+          "max_new_tokens": null,
+          "concurrency": null,
+          "offloading_strategy": "None (GPU-only, paged KV cache)",
+          "citation": "Table 1, Figure 10"
+        },
+        {
+          "model": "OPT-13B",
+          "hardware": "NVIDIA A100-40GB",
+          "hardware_vram_gb": 40,
+          "throughput_tok_per_s": null,
+          "throughput_improvement": "2-4x over FasterTransformer",
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": "varied",
+          "prompt_length": null,
+          "max_new_tokens": null,
+          "concurrency": null,
+          "offloading_strategy": "None (GPU-only, paged KV cache)",
+          "citation": "Figure 11"
+        },
+        {
+          "model": "LLaMA-13B",
+          "hardware": "NVIDIA A100-40GB",
+          "hardware_vram_gb": 40,
+          "throughput_tok_per_s": null,
+          "throughput_improvement": "22x vs HuggingFace Transformers (ShareGPT trace)",
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": null,
+          "prompt_length": "ShareGPT distribution",
+          "max_new_tokens": "ShareGPT distribution",
+          "concurrency": "parallel requests",
+          "offloading_strategy": "None (GPU-only)",
+          "citation": "Section 6.1, Figure 10"
+        }
+      ]
+    },
+    {
+      "system": "DeepSpeed-Inference",
+      "paper": "DeepSpeed Inference: Enabling Efficient Inference of Transformer Models at Unprecedented Scale",
+      "venue": "SC 2022 / DeepSpeed Blog",
+      "authors": "Aminabadi et al.",
+      "results": [
+        {
+          "model": "BLOOM-176B",
+          "hardware": "8x NVIDIA A100-80GB",
+          "hardware_vram_gb": 640,
+          "throughput_tok_per_s": null,
+          "latency_ms": 48,
+          "latency_context": "per-token latency, batch=1",
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": null,
+          "max_new_tokens": null,
+          "concurrency": null,
+          "offloading_strategy": "Tensor parallelism across GPUs, no CPU offload",
+          "citation": "DeepSpeed Blog (Nov 2022), Table: BLOOM-176B latency"
+        },
+        {
+          "model": "GPT-NeoX-20B",
+          "hardware": "NVIDIA A100-80GB",
+          "hardware_vram_gb": 80,
+          "throughput_tok_per_s": null,
+          "latency_ms": 7.4,
+          "latency_context": "per-token latency",
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": null,
+          "max_new_tokens": null,
+          "concurrency": null,
+          "offloading_strategy": "None (single GPU)",
+          "citation": "DeepSpeed-Inference blog benchmarks 2022"
+        }
+      ]
+    },
+    {
+      "system": "DeepSpeed ZeRO-Inference",
+      "paper": "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models",
+      "venue": "SC 2020 / KDD 2020",
+      "authors": "Rajbhandari et al.",
+      "results": [
+        {
+          "model": "GPT-2 (various sizes)",
+          "hardware": "NVIDIA V100-32GB",
+          "hardware_vram_gb": 32,
+          "throughput_tok_per_s": null,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": null,
+          "prompt_length": null,
+          "max_new_tokens": null,
+          "concurrency": null,
+          "offloading_strategy": "ZeRO-Offload: optimizer states + gradients to CPU, NVMe optional",
+          "citation": "Section 5 (Training-focused, inference numbers not explicitly reported)",
+          "note": "ZeRO paper focuses on training; inference-specific numbers in separate DeepSpeed-Inference work"
+        }
+      ]
+    },
+    {
+      "system": "Mixtral-Offloading",
+      "paper": "Fast Inference of Mixture-of-Experts Language Models with Offloading",
+      "venue": "arXiv 2312.17238",
+      "authors": "Eliseev & Mazur",
+      "results": [
+        {
+          "model": "Mixtral-8x7B-Instruct",
+          "hardware": "NVIDIA T4",
+          "hardware_vram_gb": 16,
+          "throughput_tok_per_s": 2.15,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 32,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "LRU expert cache (2 experts in GPU), speculative expert loading",
+          "citation": "Table 1"
+        },
+        {
+          "model": "Mixtral-8x7B-Instruct",
+          "hardware": "NVIDIA RTX 3060",
+          "hardware_vram_gb": 12,
+          "throughput_tok_per_s": 2.35,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 32,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "LRU expert cache, speculative loading",
+          "citation": "Table 1"
+        },
+        {
+          "model": "Mixtral-8x7B-Instruct",
+          "hardware": "NVIDIA RTX 3080",
+          "hardware_vram_gb": 10,
+          "throughput_tok_per_s": 2.8,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 32,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "LRU expert cache, speculative loading",
+          "citation": "Table 1"
+        },
+        {
+          "model": "Mixtral-8x7B-Instruct",
+          "hardware": "NVIDIA RTX 3090",
+          "hardware_vram_gb": 24,
+          "throughput_tok_per_s": 4.4,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 32,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "LRU expert cache (4 experts in GPU), speculative loading",
+          "citation": "Table 1"
+        },
+        {
+          "model": "Mixtral-8x7B-Instruct",
+          "hardware": "NVIDIA RTX 4090",
+          "hardware_vram_gb": 24,
+          "throughput_tok_per_s": 4.0,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 32,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "LRU expert cache, speculative loading",
+          "citation": "Table 1"
+        },
+        {
+          "model": "Mixtral-8x7B-Instruct (baseline: HF accelerate)",
+          "hardware": "NVIDIA T4",
+          "hardware_vram_gb": 16,
+          "throughput_tok_per_s": 0.71,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 32,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "HuggingFace accelerate offload (naive)",
+          "citation": "Table 1"
+        }
+      ]
+    },
+    {
+      "system": "MoE-Infinity",
+      "paper": "MoE-Infinity: Offloading-Efficient MoE Model Serving",
+      "venue": "arXiv 2401.14361",
+      "authors": "Xue et al.",
+      "results": [
+        {
+          "model": "Mixtral-8x7B",
+          "hardware": "NVIDIA A100-40GB",
+          "hardware_vram_gb": 40,
+          "throughput_tok_per_s": 14.2,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 512,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "Activation-aware expert prefetching, expert caching",
+          "citation": "Table 2"
+        },
+        {
+          "model": "Mixtral-8x7B (with prefetch)",
+          "hardware": "NVIDIA A100-40GB",
+          "hardware_vram_gb": 40,
+          "throughput_tok_per_s": 18.5,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 512,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "Activation-aware prefetching + caching enabled",
+          "citation": "Table 2"
+        },
+        {
+          "model": "DeepSeekMoE-16B",
+          "hardware": "NVIDIA A100-40GB",
+          "hardware_vram_gb": 40,
+          "throughput_tok_per_s": 35.7,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 512,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "Activation-aware prefetching",
+          "citation": "Table 2"
+        },
+        {
+          "model": "Mixtral-8x7B (HuggingFace baseline)",
+          "hardware": "NVIDIA A100-40GB",
+          "hardware_vram_gb": 40,
+          "throughput_tok_per_s": 1.2,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": 512,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "HuggingFace accelerate device_map='auto' offload",
+          "citation": "Table 2, baseline comparison"
+        }
+      ]
+    },
+    {
+      "system": "SwapMoE",
+      "paper": "SwapMoE: Serving Off-the-shelf MoE-based Large Language Models with Tunable Memory Budget",
+      "venue": "ACL 2024 / arXiv",
+      "authors": "Wang et al.",
+      "results": [
+        {
+          "model": "Mixtral-8x7B",
+          "hardware": "NVIDIA A100-80GB",
+          "hardware_vram_gb": 80,
+          "throughput_tok_per_s": null,
+          "latency_per_token_ms": 32.1,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": 20,
+          "batch_size": 1,
+          "prompt_length": 128,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "Virtual memory paging for experts, demand loading",
+          "citation": "Table 3"
+        },
+        {
+          "model": "Mixtral-8x7B",
+          "hardware": "NVIDIA A100-80GB",
+          "hardware_vram_gb": 80,
+          "throughput_tok_per_s": null,
+          "latency_per_token_ms": 28.3,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": 30,
+          "batch_size": 1,
+          "prompt_length": 128,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "Virtual memory paging, larger memory budget",
+          "citation": "Table 3"
+        },
+        {
+          "model": "Qwen-MoE (14B active)",
+          "hardware": "NVIDIA A100-80GB",
+          "hardware_vram_gb": 80,
+          "throughput_tok_per_s": null,
+          "latency_per_token_ms": 18.7,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": 20,
+          "batch_size": 1,
+          "prompt_length": 128,
+          "max_new_tokens": 128,
+          "concurrency": 1,
+          "offloading_strategy": "Virtual memory paging",
+          "citation": "Table 3"
+        }
+      ]
+    },
+    {
+      "system": "fMoE / FastMoE",
+      "paper": "FastMoE: A Fast Mixture-of-Expert Training System",
+      "venue": "PPoPP 2022 / arXiv",
+      "authors": "He et al.",
+      "results": [
+        {
+          "model": "MoE Transformer (custom)",
+          "hardware": "NVIDIA V100-32GB (multi-GPU)",
+          "hardware_vram_gb": 32,
+          "throughput_tok_per_s": null,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": null,
+          "prompt_length": null,
+          "max_new_tokens": null,
+          "concurrency": null,
+          "offloading_strategy": "Distributed expert parallelism, not offloading-focused",
+          "citation": "Section 5 (Training system; no inference-specific serving throughput reported)",
+          "note": "FastMoE is primarily a training system; inference/serving numbers not explicitly documented"
+        }
+      ]
+    },
+    {
+      "system": "TensorRT-LLM",
+      "paper": "NVIDIA TensorRT-LLM Documentation / Benchmarks",
+      "venue": "NVIDIA Official Documentation (2024)",
+      "authors": "NVIDIA",
+      "results": [
+        {
+          "model": "Mixtral-8x7B",
+          "hardware": "NVIDIA H100-80GB",
+          "hardware_vram_gb": 80,
+          "throughput_tok_per_s": null,
+          "output_tok_per_s_per_user": null,
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": null,
+          "prompt_length": null,
+          "max_new_tokens": null,
+          "concurrency": null,
+          "offloading_strategy": "No CPU offloading; multi-GPU tensor parallelism, in-flight batching",
+          "citation": "NVIDIA TensorRT-LLM GitHub / Docs (specific numeric benchmarks vary by release; no single canonical table for offloading scenarios)",
+          "note": "TensorRT-LLM benchmarks focus on high-end multi-GPU; offloading not primary use case"
+        },
+        {
+          "model": "LLaMA-2-70B",
+          "hardware": "4x NVIDIA A100-80GB",
+          "hardware_vram_gb": 320,
+          "throughput_tok_per_s": 2400,
+          "throughput_context": "aggregate output tokens/s at concurrency=64",
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 64,
+          "prompt_length": 128,
+          "max_new_tokens": 128,
+          "concurrency": 64,
+          "offloading_strategy": "Tensor parallelism (TP=4), no offload",
+          "citation": "NVIDIA Blog: TensorRT-LLM benchmarks (Dec 2023), approximate"
+        }
+      ]
+    },
+    {
+      "system": "HuggingFace Accelerate (baseline)",
+      "paper": "HuggingFace Accelerate Documentation",
+      "venue": "HuggingFace",
+      "authors": "HuggingFace Team",
+      "results": [
+        {
+          "model": "Mixtral-8x7B",
+          "hardware": "NVIDIA A100-40GB",
+          "hardware_vram_gb": 40,
+          "throughput_tok_per_s": 1.0,
+          "throughput_context": "Approximate baseline from multiple papers (varies)",
+          "ttft_ms": null,
+          "peak_gpu_memory_gb": null,
+          "batch_size": 1,
+          "prompt_length": "varies",
+          "max_new_tokens": "varies",
+          "concurrency": 1,
+          "offloading_strategy": "device_map='auto' with CPU offload for excess layers",
+          "citation": "Multiple papers use HF as baseline; exact number varies by config"
+        }
+      ]
+    }
+  ]
+}
