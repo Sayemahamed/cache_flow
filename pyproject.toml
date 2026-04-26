@@ -1,16 +1,20 @@
 [project]
-name = "thesis"
+name = "cacheflow"
 version = "0.1.0"
-description = "Add your description here"
+description = "Software-Level Expert Scheduling for Mixture-of-Experts"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
-    "accelerate>=1.12.0",
-    "bitsandbytes>=0.49.1",
-    "matplotlib>=3.10.8",
-    "pandas>=2.3.3",
-    "scipy>=1.17.0",
-    "seaborn>=0.13.2",
-    "torch>=2.9.1",
-    "transformers>=4.57.6",
+    "torch>=2.1.0",
+    "transformers>=4.45.0",
+    "accelerate>=0.27.0",
+    "safetensors>=0.4.2",
+    "rich>=12.3.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.13.0"
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
