@@ -6,7 +6,7 @@ The CacheFlow system is built to facilitate Mixture-of-Experts (MoE) inference w
 
 The suggested method is an optimization at the system level, which does not alter the original MoE architecture or the structure of the transformer models. Rather, it runs on the layer level by replacing conventional parallel expert modules with an optimized implementation which has built-in direct disk I/O, smart memory staging, asynchronous prefetching and temporal cache freezing functionality. Instead of storing all expert weights on host RAM (as in traditional solutions), CacheFlow takes advantage of the fact that expert weight files are compactly stored on the disk in the safetensors format. This system directly reads the necessary expert weights on-demand out of disk, stages them via CPU-pinned memory buffers and asynchronously transfers them to GPU slots. An advanced caching scheme that intra-batch freezes keep common experts in GPU memory and cold experts loadable and able to be accommodated with a fixed capacity constraint.
 
-Such a three-tier architecture (Disk, Pinned RAM, and GPU VRAM) forms a memory-performance trade-off space in which capacity can be configured on a per-application basis. The system is computational correct and experiences dramatic memory footprints cuts on the GPU and allows previously unreachable models to be run by resource-constrained systems.
+Such a three-tier architecture (Disk, Pinned RAM, and GPU VRAM) forms a memory-performance trade-off space in which capacity can be configured on a per-application basis. The system is computationally correct and experiences dramatic memory footprint cuts on the GPU and allows previously unreachable models to be run by resource-constrained systems.
 
 ## 3.2 System Architecture and Memory Pipeline
 
@@ -436,42 +436,120 @@ The entire process of the lifecycle of a single forward pass is:
 
 This is repeated every forward pass (each token or batch of tokens in generation).
 
-**3.6 Implementation Environment** ** **
+## 3.6 Implementation Environment
 
-**3.6.1 Software Stack** ** **
+### 3.6.1 Software Stack
 
-**The Python 3.8+** **CacheFlow** **implementation will use the following core libraries:** ** **
+The Python 3.8+ CacheFlow implementation uses the following core libraries:
 
-**PyTorch** **(1.13+):** **PyTorch** **offers operations on tensors,** **gpu** **memory handling,** **cuda** **stream and event control, and supports all the computations of neural networks. Specifically,** **torch.cuda.Stream**() and **torch.cuda.Asynchronous** **transfer coordination is done by using** **Event(**)s. ** **
+- **PyTorch (1.13+):** Offers operations on tensors, GPU memory handling, CUDA stream and event control, and supports all the computations of neural networks. Specifically, `torch.cuda.Stream()` and `torch.cuda.Event()` are used for asynchronous transfer coordination.
 
-**Safetensors** **(0.3.1+): Implements the safe open context manager and the get slice method to extract expert weight slices efficiently and without any copying of data to the storage, as well as to disk-resident weight files.** ** **
+- **Safetensors (0.3.1+):** Implements the safe open context manager and the get_slice method to extract expert weight slices efficiently and without any copying of data to the storage, as well as to disk-resident weight files.
 
-**Transformers Library (Hugging Face, 4.0+): Allows loading of pretrained** **MoE** **model settings (e.g., IBM Granite, Qwen2-MoE), and tokenization utility.** ** **
+- **Transformers Library (Hugging Face, 4.0+):** Allows loading of pretrained MoE model settings (e.g., IBM Granite, Qwen2-MoE), and tokenization utility.
 
-**CUDA Toolkit (11.8+): It offers the capability of** **utilizing** **the GPU** **compute**, memory, and PCIe DMA. ** **
+- **CUDA Toolkit (11.8+):** Offers the capability of utilizing the GPU compute, memory, and PCIe DMA.
 
-**Accelerate Library (0.20+): Makes it easy to use several devices as inference and model loading strategies.** ** **
+- **Accelerate Library (0.20+):** Makes it easy to use several devices as inference and model loading strategies.
 
-**3.6.2 Hardware Configuration** ** **
+### 3.6.2 Hardware Configuration
 
-**The implementation is tested on the hardware setups in the following configurations:** ** **
+The implementation is tested on the hardware setups in the following configurations:
 
-**The environment of Development and Experimentation:** ** **
+**Development and Experimentation Environment:**
 
-**GPU: NVIDIA T4 (16 GB VRAM) or NVIDIA H100 (80 GB VRAM) in the cloud environments (Google** **Colab**, Lambda Labs) ** **
+- **GPU:** NVIDIA T4 (16 GB VRAM) or NVIDIA H100 (80 GB VRAM) in cloud environments (Google Colab, Lambda Labs)
+- **CPU:** x86-64 processor with 16-64 GB system RAM, PCIe to graphics card
+- **Storage:** NVMe SSD (to access the disk fast, which allows to run MmapExpertStore operations efficiently) or network-attached storage
+- **Interconnect:** PCIe 4.0 or PCIe 3.0, which offers a theoretical bandwidth of 1632 GB/s for GPU transfers
 
-**CPU: x86-64 processor with 16-64 GB system RAM,** **PCIe to** **graphics card.** ** **
+**Target Deployment Hardware:**
 
-**Storage:** **NVMe** **SSD (to access the disk fast, which** **allows to run** **MmapExpertStore** **operations efficiently) or network-attached storage.** ** **
+- **Consumer-grade GPUs:** NVIDIA RTX 3060 (12 GB), RTX 4070 (12 GB), RTX 4090 (24 GB)
+- **Embedded Systems:** NVIDIA Jetson Orin (12 GB VRAM, shared with CPU)
+- **Storage:** External USB 3.1 or local SSD (500 MB/s read bandwidth minimum)
+- **System RAM:** 32-64 GB minimum for pinned memory allocation and staging buffers
 
-**Interconnect: PCIe 4.0 or PCIe 3.0, which offers a** **theoretic** **bandwidth of 1632 GB/s in case of transfers of the GPU.** ** **
+### 3.6.3 Model Under Test
 
-**Target Deployment Hardware:** ** **
+The analysis is centered on models that have the GraniteMoeParallelExperts architecture. The primary model used for evaluation is:
 
-**Consumer-grade GPUs: NVIDIA RTX 3060 (12 GB), RTX 4070 (12 GB), RTX 4090 (24 GB)** ** **
+**IBM Granite 3.1-3B-A800M-Instruct:**
 
-**Embedded Systems: NVIDIA Jetson Orin (12 GB VRAM, share with CPU)** ** **
+- **Architecture:** Transformer-based with sparse MoE routing in particular layers
+- **Total Parameters:** Approximately 3 billion
+- **MoE Structure:** Multiple layers of MoE, each with 60 experts
+- **Expert Dimensions:** Generally 2048 hidden dimension with 8192 intermediate dimension
+- **Expert Floating-point:** float16 (half precision) or int8 (quantized)
+- **Mode of Inference:** Causal language prediction (next-token prediction)
+- **Weight File Format:** safetensors (compressed, slice-accessible)
 
-**Storage: External USB 3.1 or local SSD (500 MB/s read bandwidth will be** **required** **at minimum)** ** **
+This model class selection enables controlled benchmarking on real, production-scale MoE architectures that are still accessible to undergraduate research projects.
 
-**System RAM: 32-64 GB** **minimum** **amount of pinned memory allocation and staging buffers.** ** **
+### 3.6.4 Experimental Protocol
+
+CacheFlow validation is structured in the following way:
+
+**Baseline Measurement:** Establish the naive expert loading baseline (all experts in GPU memory or standard disk-loading without staging). Measure:
+
+- Maximum memory usage in GB by GPUs (via `torch.cuda.max_memory_allocated()`)
+- Inference latency (time per token generated, averaged over 50 tokens)
+- Throughput (tokens/s)
+- Out-of-memory errors (where applicable)
+
+**Configuration Space Exploration:** Experiment with the CacheFlow system at different capacity constraints:
+
+- GPU Slot Capacity: $C \in \{2, 4, 8, 16\}$
+- Staging Buffers: $S_{staging} \in \{4, 8, 16\}$
+
+**Post-Optimization Measurement:** For each configuration, measure:
+
+- Maximum GPU memory usage (via `torch.cuda.max_memory_used()`)
+- Inference latency (time per token)
+- Throughput (tokens/s)
+- Cache hit rate (number of experts hit / number of expert requests)
+- Cache evictions (number of times a disk reload is required)
+- Disk I/O time (time spent in `store.load_expert()`)
+- PCIe transfer time (time spent in `event.synchronize()` waits)
+
+**Inference Tasks:**
+
+- **Short:** Generate 20 new tokens on the prompt "Briefly explain how Mixture-of-Experts models work."
+- **Long-form:** Generate 100 new tokens on the prompt "Write an essay on the architecture of normal Transformers and Mixture-of-Experts models in detail!"
+
+These tasks enable observation of cache behavior for both short and long sequences.
+
+**Metrics Logging:** All metrics are recorded using:
+
+- CUDA profiling APIs of PyTorch: `torch.cuda.max_memory_allocated()`, `torch.cuda.synchronize()`
+- Specialized timing instrumentation around `store.load_expert()`, `nextstaging()`, and `event.synchronize()` invocations
+- ExpertCache statistics (hit/miss counts, frozen set size)
+
+### 3.6.5 Correctness Validation
+
+Numerical accuracy is achieved by running the optimized model against the reference baseline:
+
+**Deterministic Execution:** Both the baseline and CacheFlow-optimized models are run in deterministic mode (where possible, disabling non-deterministic CUDA operations) with fixed input prompts and random seeds.
+
+**Token-Level Comparison:** The sequence of output tokens is compared for exact matches, ensuring:
+
+- The routing decisions are identical (same experts chosen for each token)
+- Expert calculations produce equivalent outcomes
+- Output logits differ only at floating-point roundoff errors
+
+**Numerical Tolerance:** Logit-level numerical accuracy is checked within floating-point tolerance:
+
+- **Float32:** Relative error < 1e-5
+- **Float16:** Relative error < 1e-3
+
+**Inference Stability:** The system is run on 10 distinct input prompts to confirm accuracy when routing patterns vary.
+
+This verification confirms that the CacheFlow scheduling mechanism (disk loading, staging, asynchronous transfer, freezing, and eviction) creates no computational errors or degradation in model inference behavior.
+
+## Summary
+
+The CacheFlow approach offers a system-level framework to support efficient MoE inference on memory-constrained GPUs through a novel three-level memory hierarchy. The system decouples GPU memory needs from the total number of expert parameters through staged pinning and asynchronous PCIe transfers. Cache freezing introduces guarantees for accuracy in dynamic, batch-contingent situations where required experts must be protected from accidental eviction. 
+
+The mathematical framework explains how capacity limits regulate GPU memory consumption regardless of the overall number of experts. Asynchronous execution flow demonstrates how overlapping disk I/O, PCIe transfer, and GPU computation reduces latency. State-of-the-art LRU cache management with intra-batch freezing ensures efficient cache utilization while maintaining safety.
+
+Based on production-intent MoE architectures and tested on realistic hardware setups, CacheFlow has been shown to be practically applicable to implementing large MoE models on resource-constrained systems that could otherwise not support such models.
