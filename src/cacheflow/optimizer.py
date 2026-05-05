@@ -136,8 +136,6 @@ def _replace_parallel_experts_in_module(module: nn.Module, num_gpu_slots: int, p
             optimized.to(device=child.weight.device, dtype=child.weight.dtype)
             setattr(module, child_name, optimized)
             
-            # Delete the old child module immediately to release the tensor reference
-            del child 
             replaced += 1
         else:
             replaced += _replace_parallel_experts_in_module(child, num_gpu_slots, full_name)

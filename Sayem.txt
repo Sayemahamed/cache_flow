@@ -1,0 +1,20 @@
+Slide 6, 7, & 8: Related Works
+"Thank you, Fahim. Before designing our system, we analyzed the current landscape. We know MoE scales capacity beautifully, and we know techniques like PagedAttention optimize standard LLM memory. However, none of these techniques address the massive footprint of the MoE expert weights themselves."  
+
+Slide 9 & 10: Comparative Summary
+"Looking at this comparative summary, foundational models like the Switch Transformer introduced sparse compute, but required full memory residency. Recent systems like SwapMoE and MoE-Infinity attempt CPU-to-GPU swapping, but suffer from high transfer overhead and thrashing. CacheFlow is the only architecture here that provides asynchronous transfers to completely hide disk latency."  
+
+Slide 11 & 12: Theoretical Background & What is CacheFlow?
+"Because MoE routing is dynamic, only a subset of experts is actually needed at any given time. CacheFlow exploits this sparsity. It is a memory-aware scheduling framework integrated directly into the inference loop, controlling exactly which experts are allowed in the GPU to prevent crashes."  
+
+Slide 13 & 14: CacheFlow Concept & Three-Tier Methodology
+"Think of CacheFlow as a highly efficient logistics pipeline. We built a three-tier memory hierarchy.
+Tier 1 is the Disk Storage, where we slice specific experts directly from Safetensors files.
+Tier 2 is the Pinned Memory Staging—our loading dock—which decouples the slow disk from the fast GPU.
+Tier 3 is the Active GPU slots."  
+
+Slide 15: Asynchronous Execution Flow
+"To prevent the GPU from waiting, we use CUDA streams to overlap operations. While Expert A is being read from the disk, Expert B is traveling over the PCIe bus, and the GPU is actively computing Expert C. This asynchronous flow is what keeps latency low."  
+
+Slide 16: LRU Cache & Intra-Batch Freezing
+"Finally, to manage the active GPU slots, we designed an LRU cache with 'Intra-Batch Freezing'. At the start of a forward pass, we lock the required experts in the cache. This guarantees that while we are loading new experts from the disk, we don't accidentally evict an expert that the current batch is actively using. I will now hand it over to my partner to demonstrate the results."  
